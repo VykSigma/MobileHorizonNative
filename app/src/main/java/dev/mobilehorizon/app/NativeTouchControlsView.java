@@ -42,6 +42,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
+import dev.mobilehorizon.app.layout.ControlButton;
+import dev.mobilehorizon.app.layout.ControlLayout;
+import dev.mobilehorizon.app.layout.LayoutBridge;
+import dev.mobilehorizon.app.layout.LayoutManager;
+
 /** Multi-touch overlay: joystick, mouse look, and compact action buttons. */
 final class NativeTouchControlsView extends View {
     static final String PREFERENCES = "mobilehorizon_touch_controls";
@@ -56,6 +61,14 @@ final class NativeTouchControlsView extends View {
     private static final String KEY_UNIFORM_SIZE_VERSION = "uniform_button_size_version";
     private static final String KEY_FLOAT_MENU_X = "floating_menu_x";
     private static final String KEY_FLOAT_MENU_Y = "floating_menu_y";
+
+    // --- New Zalith-inspired layout system ---
+    private static final String KEY_USE_NEW_LAYOUT = "use_new_layout_v1";
+    private LayoutManager layoutManager;
+    private List<LayoutBridge.RenderItem> renderItems = new ArrayList<>();
+    private boolean useNewLayoutSystem = true;
+    private LayoutBridge.RenderItem activeNewItem = null;
+
 
     private static final long LONG_PRESS_TIMEOUT_MS = 430L;
     private static final long DOUBLE_TAP_TIMEOUT_MS = 300L;
@@ -78,6 +91,7 @@ final class NativeTouchControlsView extends View {
     private final NativeGameActivity gameActivity;
     private final boolean previewOnly;
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint snapMeasurePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path cursorPath = new Path();
     private final Map<Integer, PointerTrack> pointers = new HashMap<>();
@@ -215,6 +229,9 @@ final class NativeTouchControlsView extends View {
         }
         floatingMenuX = clamp(prefs.getFloat(KEY_FLOAT_MENU_X, 0.52f), 0.04f, 0.96f);
         floatingMenuY = clamp(prefs.getFloat(KEY_FLOAT_MENU_Y, 0.14f), 0.06f, 0.94f);
+        useNewLayoutSystem = prefs.getBoolean(KEY_USE_NEW_LAYOUT, true);
+        layoutManager = new LayoutManager(activity);
+        refreshRenderItems();
         gameplayMode = gameActivity != null && gameActivity.isGameplayMode();
         if (gameActivity != null) modeHandler.post(modePoll);
         if (previewOnly) {
@@ -229,13 +246,157 @@ final class NativeTouchControlsView extends View {
         virtualMouseY = getResources().getDisplayMetrics().heightPixels / 2f;
     }
 
+
+    /** Rebuild flat render list from the new layout system. */
+    private void refreshRenderItems() {
+        if (layoutManager == null) {
+            renderItems = new ArrayList<>();
+            return;
+        }
+        renderItems = LayoutBridge.flatten(layoutManager.getCurrent(), gameplayMode);
+    }
+
+    private void drawNewLayout(Canvas canvas) {
+        int w = getWidth();
+        int h = getHeight();
+        if (w <= 0 || h <= 0) return;
+        for (LayoutBridge.RenderItem item : renderItems) {
+            if (item.kind == LayoutBridge.RenderItem.Kind.JOYSTICK) {
+                drawNewJoystick(canvas, item, w, h);
+            } else {
+                drawNewButton(canvas, item, w, h);
+            }
+        }
+    }
+
+    private void drawNewJoystick(Canvas canvas, LayoutBridge.RenderItem item, int w, int h) {
+        float cx = item.x * w;
+        float cy = item.y * h;
+        float radius = item.radius * Math.min(w, h) * item.scale;
+        // If actively dragged, follow finger via activeNewItem position stored in item (runtime)
+        if (activeNewItem != null && activeNewItem.uuid.equals(item.uuid) && joystickPointer != -1) {
+            PointerTrack track = pointers.get(joystickPointer);
+            if (track != null) {
+                // keep base at home, knob follows — base stays at layout position
+            }
+        }
+        float effectiveOpacity = clamp(item.opacity, 0.20f, 1f);
+        drawJoystickBase(canvas, cx, cy, radius, 0, effectiveOpacity);
+        float knobX = cx, knobY = cy;
+        if (joystickPointer != -1 && activeNewItem != null && activeNewItem.uuid.equals(item.uuid)) {
+            PointerTrack track = pointers.get(joystickPointer);
+            if (track != null) {
+                float dx = track.lastX - cx, dy = track.lastY - cy;
+                float len = (float) Math.sqrt(dx * dx + dy * dy), max = radius * 0.66f;
+                if (len > max && len > 0) { dx *= max / len; dy *= max / len; }
+                knobX += dx; knobY += dy;
+            }
+        }
+        circle(canvas, knobX, knobY, radius * 0.37f, false, 0.94f, effectiveOpacity);
+        circle(canvas, knobX, knobY, radius * 0.37f, true, 1f, effectiveOpacity);
+    }
+
+    private void drawNewButton(Canvas canvas, LayoutBridge.RenderItem item, int w, int h) {
+        float cx = item.x * w;
+        float cy = item.y * h;
+        float bw = item.width * w;
+        float bh = item.height * h;
+        float left = cx - bw / 2f;
+        float top = cy - bh / 2f;
+        RectF bounds = new RectF(left, top, left + bw, top + bh);
+        float effectiveOpacity = clamp(item.opacity, 0.20f, 1f);
+        if (item.pressed) effectiveOpacity = Math.min(1f, effectiveOpacity + 0.12f);
+
+        int baseColor = item.styleColor;
+        int a = Math.round(Color.alpha(baseColor) * effectiveOpacity);
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(Color.argb(a, Color.red(baseColor), Color.green(baseColor), Color.blue(baseColor)));
+        float corner = Math.min(bw, bh) * 0.28f;
+        if (item.shape == ControlButton.Shape.CIRCLE) {
+            canvas.drawOval(bounds, paint);
+        } else if (item.shape == ControlButton.Shape.RECT) {
+            canvas.drawRect(bounds, paint);
+        } else {
+            canvas.drawRoundRect(bounds, corner, corner, paint);
+        }
+
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(1.2f));
+        paint.setColor(Color.argb(Math.round(220 * effectiveOpacity), 228, 236, 255));
+        if (item.shape == ControlButton.Shape.CIRCLE) {
+            canvas.drawOval(bounds, paint);
+        } else if (item.shape == ControlButton.Shape.RECT) {
+            canvas.drawRect(bounds, paint);
+        } else {
+            canvas.drawRoundRect(bounds, corner, corner, paint);
+        }
+
+        if (item.label != null && !item.label.isEmpty()) {
+            textPaint.setColor(Color.argb(Math.round(255 * effectiveOpacity), 
+                Color.red(item.textColor), Color.green(item.textColor), Color.blue(item.textColor)));
+            textPaint.setTextAlign(Paint.Align.CENTER);
+            float textSize = Math.max(dp(10f), Math.min(bh * 0.38f, bw * 0.28f));
+            textPaint.setTextSize(textSize);
+            Paint.FontMetrics fm = textPaint.getFontMetrics();
+            float ty = cy - (fm.ascent + fm.descent) / 2f;
+            canvas.drawText(item.label, cx, ty, textPaint);
+        }
+    }
+
+    private LayoutBridge.RenderItem hitNewLayout(float x, float y) {
+        int w = getWidth(), h = getHeight();
+        if (w <= 0 || h <= 0 || renderItems.isEmpty()) return null;
+        return LayoutBridge.hitTest(renderItems, x / w, y / h);
+    }
+
+    private void applyNewItemPress(LayoutBridge.RenderItem item, boolean pressed) {
+        if (item == null) return;
+        item.pressed = pressed;
+        switch (item.actionType) {
+            case KEY:
+                if (item.keyCode > 0) setKeyHeld(item.keyCode, pressed);
+                break;
+            case MOUSE_BUTTON:
+                int btn = item.mouseButton == 1 ? MotionEvent.BUTTON_SECONDARY
+                        : item.mouseButton == 2 ? MotionEvent.BUTTON_TERTIARY
+                        : MotionEvent.BUTTON_PRIMARY;
+                setMouseButton(btn, pressed, item.x * getWidth(), item.y * getHeight());
+                break;
+            case HOTBAR_SLOT:
+                if (pressed && item.hotbarSlot >= 1 && item.hotbarSlot <= 9) {
+                    setKeyHeld(KeyEvent.KEYCODE_1 + (item.hotbarSlot - 1), true);
+                    setKeyHeld(KeyEvent.KEYCODE_1 + (item.hotbarSlot - 1), false);
+                }
+                break;
+            case TOGGLE_CONTROLS:
+                if (pressed) {
+                    controlsVisible = !controlsVisible;
+                    if (!controlsVisible) { editingControls = false; releaseHeldControls(); }
+                }
+                break;
+            case SWITCH_LAYER:
+                if (pressed && item.targetLayerUuid != null && layoutManager != null) {
+                    layoutManager.toggleLayer(item.targetLayerUuid);
+                    refreshRenderItems();
+                }
+                break;
+            default:
+                break;
+        }
+        invalidate();
+    }
+
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         if (controlsVisible) {
             drawSnapGuides(canvas);
-            drawJoystick(canvas);
-            for (ButtonSpec spec : buttonSpecs()) {
-                if (spec.id != JOYSTICK) drawButton(canvas, spec);
+            if (useNewLayoutSystem && layoutManager != null && !renderItems.isEmpty()) {
+                drawNewLayout(canvas);
+            } else {
+                drawJoystick(canvas);
+                for (ButtonSpec spec : buttonSpecs()) {
+                    if (spec.id != JOYSTICK) drawButton(canvas, spec);
+                }
             }
         }
         if (!previewOnly) {
@@ -1222,7 +1383,11 @@ final class NativeTouchControlsView extends View {
     }
 
     @Override public boolean onTouchEvent(MotionEvent event) {
-        if (gameActivity != null) gameplayMode = gameActivity.isGameplayMode();
+        if (gameActivity != null) {
+            boolean prev = gameplayMode;
+            gameplayMode = gameActivity.isGameplayMode();
+            if (prev != gameplayMode) refreshRenderItems();
+        }
         int action = event.getActionMasked(), index = event.getActionIndex();
         switch (action) {
             case MotionEvent.ACTION_DOWN:
@@ -1244,6 +1409,32 @@ final class NativeTouchControlsView extends View {
         float x = event.getX(index), y = event.getY(index);
         // The invisible hotbar hit zone wins at the bottom-center HUD area, so
         // taps on slots 1 and 9 are not swallowed by the joystick's larger hit radius.
+        // New layout system hit-test (buttons/joystick from ControlLayout)
+        if (useNewLayoutSystem && layoutManager != null && !editingControls && controlsVisible) {
+            LayoutBridge.RenderItem hit = hitNewLayout(x, y);
+            if (hit != null) {
+                int idPtr = event.getPointerId(index);
+                if (hit.kind == LayoutBridge.RenderItem.Kind.JOYSTICK) {
+                    if (joystickPointer == -1) {
+                        joystickPointer = idPtr;
+                        joystickX = x;
+                        joystickY = y;
+                        activeNewItem = hit;
+                        PointerTrack track = new PointerTrack(x, y, JOYSTICK, gameplayMode);
+                        pointers.put(idPtr, track);
+                        updateJoystick(x, y);
+                    }
+                } else {
+                    activeNewItem = hit;
+                    PointerTrack track = new PointerTrack(x, y, IGNORED, gameplayMode);
+                    track.editorDrag = false;
+                    pointers.put(idPtr, track);
+                    applyNewItemPress(hit, true);
+                }
+                return;
+            }
+        }
+
         int slot = hitHotbarSlot(x, y);
         int control = slot >= 0 ? HOTBAR_SLOT_START + slot : hitControl(x, y);
         if (control == TOGGLE) {
@@ -1364,6 +1555,20 @@ final class NativeTouchControlsView extends View {
     }
 
     private void removePointer(MotionEvent event, int index) {
+        int pid = event.getPointerId(index);
+        if (activeNewItem != null && useNewLayoutSystem) {
+            PointerTrack t = pointers.get(pid);
+            if (t != null) {
+                if (activeNewItem.kind == LayoutBridge.RenderItem.Kind.BUTTON) {
+                    applyNewItemPress(activeNewItem, false);
+                }
+                if (pid == joystickPointer) {
+                    joystickPointer = -1;
+                }
+                activeNewItem = null;
+            }
+        }
+
         int id = event.getPointerId(index);
         PointerTrack track = pointers.remove(id);
         if (track == null) return;
